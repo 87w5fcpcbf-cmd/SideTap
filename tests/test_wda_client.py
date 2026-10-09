@@ -37,6 +37,10 @@ class FakeWDA(BaseHTTPRequestHandler):
     infinity_sessions = set()  # sessions whose /actions fail with INFINITY
     hanging_sessions = set()  # sessions whose /actions hang past the timeout
     hang_seconds = 1.0
+    os_version = None  # what /status reports as the phone's iOS; None omits "os"
+    locked = False  # what /wda/locked answers
+    last_hid = None  # the /wda/performIoHidEvent payload
+    hid_locks = True  # whether that press actually locks the screen
 
     def log_message(self, *args):  # noqa: vulture
         pass
@@ -52,7 +56,12 @@ class FakeWDA(BaseHTTPRequestHandler):
     def do_GET(self):  # noqa: vulture
         FakeWDA.requests_seen.append(("GET", self.path))
         if self.path == "/status":
-            self._reply({"ready": True})
+            value = {"ready": True}
+            if FakeWDA.os_version:
+                value["os"] = {"name": "iOS", "version": FakeWDA.os_version}
+            self._reply(value)
+        elif self.path == "/wda/locked":
+            self._reply(FakeWDA.locked)
         elif self.path == "/screenshot":
             self._reply(base64.b64encode(FAKE_PNG).decode())
         elif self.path.endswith("/window/size"):
@@ -98,6 +107,13 @@ class FakeWDA(BaseHTTPRequestHandler):
                 return
             self._reply(None)
         elif self.path.endswith("/wda/apps/launch"):
+            self._reply(None)
+        elif self.path.endswith("/wda/performIoHidEvent"):
+            if self._session_dead():
+                return
+            FakeWDA.last_hid = self.payload
+            if FakeWDA.hid_locks:
+                FakeWDA.locked = True
             self._reply(None)
         elif self.path.endswith("/wda/setPasteboard"):
             if self._session_dead():
@@ -153,6 +169,10 @@ def wda(tmp_path, monkeypatch):
     FakeWDA.last_settings = None
     FakeWDA.last_actions = None
     FakeWDA.fail_settings = False
+    FakeWDA.os_version = None
+    FakeWDA.locked = False
+    FakeWDA.last_hid = None
+    FakeWDA.hid_locks = True
     client = WDAClient(base_url=f"http://127.0.0.1:{server.server_port}", timeout=5)
     yield client
     server.shutdown()
@@ -458,6 +478,39 @@ def test_lock_posts_wda_lock(wda):
     assert ("POST", "/wda/lock") in FakeWDA.requests_seen
 
 
+def test_lock_below_ios_27_still_uses_wda_lock(wda):
+    FakeWDA.os_version = "26.6"
+    wda.lock()
+    assert ("POST", "/wda/lock") in FakeWDA.requests_seen
+    assert FakeWDA.last_hid is None
+
+
+def test_lock_on_ios_27_is_a_short_power_press_not_wda_lock(wda):
+    # /wda/lock on iOS 27 holds Power for 0.5s, which iOS 27.0.1 reads as
+    # press-and-hold: Siri opened and the screen never locked (2026-10-09,
+    # docs/ERRORS.md). A 0.1s press of the same button locks.
+    FakeWDA.os_version = "27.0.1"
+    wda.lock()
+    assert ("POST", "/wda/lock") not in FakeWDA.requests_seen
+    assert FakeWDA.last_hid == {
+        "page": 0x0C,
+        "usage": 0x30,
+        "duration": wda_client._LOCK_PRESS_SECONDS,
+    }
+    assert wda_client._LOCK_PRESS_SECONDS < 0.5
+    assert ("GET", "/wda/locked") in FakeWDA.requests_seen
+
+
+def test_lock_on_ios_27_raises_when_the_screen_never_locks(wda, monkeypatch):
+    # The button must not say "Locked." over a phone that is still unlocked.
+    monkeypatch.setattr(wda_client, "_LOCK_CONFIRM_SECONDS", 0.3)
+    monkeypatch.setattr(wda_client, "_LOCK_POLL", 0.05)
+    FakeWDA.os_version = "27.0.1"
+    FakeWDA.hid_locks = False
+    with pytest.raises(WDAError, match="locked"):
+        wda.lock()
+
+
 def test_type_text_sends_characters(wda):
     wda.type_text("hi")
     assert any(p.endswith("/wda/keys") for m, p in FakeWDA.requests_seen if m == "POST")
@@ -673,6 +726,11 @@ def test_activity_summary_swipe_and_long_press():
         ]
     )
     assert _activity_summary("/session/s/actions", press) == "long-press (50, 60)"
+
+
+def test_activity_summary_names_the_lock_press():
+    press = {"page": 0x0C, "usage": 0x30, "duration": 0.1}
+    assert _activity_summary("/session/s/wda/performIoHidEvent", press) == "lock"
 
 
 def test_activity_summary_skips_stream_tuning():

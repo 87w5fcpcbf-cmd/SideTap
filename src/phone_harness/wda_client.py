@@ -94,6 +94,17 @@ def session_file():
 # costs one 0.01s call.
 _SLEEP_SUSPECT_SECONDS = 30.0
 
+# iOS 27 lock. WDA 15.1.5+ (appium/WebDriverAgent#1171) answers /wda/lock there
+# with a 0.5s IOHID Power hold, and iOS 27.0.1 reads a 0.5s hold as the side
+# button's press-and-hold: Siri opened, the screen never locked, and the call
+# timed out after 6.2s. A 0.1s press of the same button locked in 1.1s
+# (measured on device 2026-10-09, docs/ERRORS.md). Below 27, /wda/lock is
+# pressLockButton and still works, so that path is unchanged. The confirm
+# window is WDA's own FBScreenLockTimeout.
+_LOCK_PRESS_SECONDS = 0.1
+_LOCK_CONFIRM_SECONDS = 5.0
+_LOCK_POLL = 0.25
+
 
 def _read_shared_session() -> str | None:
     try:
@@ -142,6 +153,8 @@ def _activity_summary(path: str, payload: dict | None) -> str | None:
         return f"set clipboard ({len(raw_b64)} b64 chars)"
     if path.endswith("/wda/pressButton"):
         return f"button: {payload.get('name', '?')}"
+    if path.endswith("/wda/performIoHidEvent"):
+        return "lock" if payload.get("usage") == 0x30 else "hardware button"
     if path.endswith("/wda/apps/launch"):
         return f"open app: {payload.get('bundleId', '?')}"
     if path.endswith("/actions"):
@@ -538,7 +551,8 @@ class WDAClient:
 
     # DISPLAY-ONLY: /wda/locked can report unlocked with the passcode pad on
     # screen (a test pins that unlock() never consults it). The viewer's status
-    # strip shows it; nothing may act on it.
+    # strip shows it; nothing may act on it. lock() confirms with it, which is
+    # the same signal WDA's own /wda/lock waits on.
     def is_locked(self) -> bool:  # noqa: vulture  (called by viewer.py)
         return bool(self._request("GET", "/wda/locked"))
 
@@ -759,8 +773,28 @@ class WDAClient:
     def lock(self) -> None:  # noqa: vulture  (called by viewer.py)
         """Lock the screen. Right after an unlock, iOS's require-passcode
         grace period can make this time out while the screen still turns off —
-        treat that error as cosmetic, not a failure to lock."""
-        self._request("POST", "/wda/lock")
+        treat that error as cosmetic, not a failure to lock.
+
+        iOS 27+ gets a short Power press instead of /wda/lock, whose 0.5s
+        hold opens Siri there (see _LOCK_PRESS_SECONDS)."""
+        try:
+            version = str(self.status()["os"]["version"])
+            major = int(version.split(".")[0])
+        except (KeyError, TypeError, ValueError):
+            major = 0
+        if major < 27:
+            self._request("POST", "/wda/lock")
+            return
+        self._session_request(
+            "POST",
+            "/wda/performIoHidEvent",
+            {"page": 0x0C, "usage": 0x30, "duration": _LOCK_PRESS_SECONDS},
+        )
+        deadline = time.monotonic() + _LOCK_CONFIRM_SECONDS
+        while not self.is_locked():
+            if time.monotonic() >= deadline:
+                raise WDAError("Timed out while waiting until the screen gets locked")
+            time.sleep(_LOCK_POLL)
 
     def app_launch(self, bundle_id: str) -> None:  # noqa: vulture  (called by helpers.py)
         self._session_request("POST", "/wda/apps/launch", {"bundleId": bundle_id})

@@ -5,6 +5,20 @@ entries only. Newest first.
 
 ---
 
+## 2026-10-09 — Lock button opened Siri after the iOS 27 update
+
+- Symptom: after updating to iOS 27.0.1, the viewer's Lock button summoned
+  Siri and the screen stayed on. `POST /wda/lock` failed after 6.2s with
+  "Timed out while waiting until the screen gets locked".
+- Root cause: WDA 15.1.5+ (we run 16.1.4) switches `/wda/lock` on iOS 27 to
+  an IOHID Power event held for 0.5s (appium/WebDriverAgent#1171, because
+  `pressLockButton` stopped locking there). On this phone a 0.5s hold is the
+  side button's press-and-hold, which is Siri.
+- Fix: on iOS 27+ `WDAClient.lock()` sends the same event itself
+  (`/wda/performIoHidEvent`, page 0x0C, usage 0x30) for 0.1s, then polls
+  `/wda/locked` for up to 5s like WDA did. Measured: locked in 1.1s, no
+  Siri. Below 27 it still calls `/wda/lock`. The version comes from `/status`.
+
 ## 2026-10-01 — Tunnel "failed to start": Hyper-V had reserved go-ios's port
 
 - Symptom: Fix input wizard stopped at "Starting tunnel + WDA" with
