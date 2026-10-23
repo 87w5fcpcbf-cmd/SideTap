@@ -1,3 +1,5 @@
 @echo off
 set "PYTHONPATH=%~dp0src;%PYTHONPATH%"
-python -m phone_harness %*
+set "PY=python"
+if exist "%~dp0.venv\Scripts\python.exe" set "PY=%~dp0.venv\Scripts\python.exe"
+"%PY%" -m phone_harness %*
